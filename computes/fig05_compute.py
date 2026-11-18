@@ -1,5 +1,5 @@
 """
-Quantities of Figure 5, what brings the central water to the 200 m isobath.
+Quantities of Figure 5, what brings the SACW to the 200 m isobath.
 
 The near-bottom temperature at the 200 m sites is the temperature of the interior
 just above the layer plus the anomaly of the layer, T_194 = T_155 + D. The layer
@@ -13,12 +13,13 @@ cross-isobath position of the Brazil Current axis over the slope (Campos et al.
 
  1  modes        empirical orthogonal functions of the daily temperature at the
                  four levels (Kundu et al. 1975), whose first mode of one sign
-                 over the column is a heave of the thermocline
+                 over the column is an uplift of the thermocline, with intervals from
+                 blocks of days resampled inside the campaigns
  2  partition    T'_194 = beta T'_155 + r from the daily departures from the campaign
-                 means, beta the share of the interior heave that reaches the
-                 lowest meter, beta^2 var(T_155) the variance the heave carries to
+                 means, beta the share of the interior uplift that reaches the
+                 lowest meter, beta^2 var(T_155) the variance the uplift carries to
                  it and var(r) the variability of the layer itself, uncorrelated
-                 with the interior
+                 with the interior, with intervals from the same blocks
  3  uplift       eta = -(T_155 - <T_155>) / <dT/dz>, the vertical displacement of
                  the isotherms at 155 m in metres, positive upward, with the
                  gradient between 85 and 155 m averaged over the campaign
@@ -34,7 +35,8 @@ cross-isobath position of the Brazil Current axis over the slope (Campos et al.
                                  exp(-(x_s - x) / (c T_f)) dx,
 
                  over the isobath south of each mooring, with c and T_f chosen on a
-                 grid by the correlation with eta and tested in campaigns left out
+                 grid by the correlation with eta and tested in campaigns left out,
+                 each correlation of the grid with its interval from the blocks
  5  axis         the daily distance of the axis of the Brazil Current from each
                  mooring along a cross-isobath section through it, from the DUACS
                  geostrophic velocity, taken with a negative sign so that a positive
@@ -43,16 +45,42 @@ cross-isobath position of the Brazil Current axis over the slope (Campos et al.
                  the position of the axis and by both, with moving block intervals, correlations tested
                  against phase randomised surrogates (Ebisuzaki 1997), and the
                  ordinary, partial and multiple coherence of eta on the two
-                 (Bendat and Piersol 2010) in the synoptic and the mesoscale band
+                 (Bendat and Piersol 2010) in the synoptic and the mesoscale band,
+                 each partial coherence with the interval of its Fisher transform
+ 7  parts        the uplift split inside each campaign into a slow part, its Lanczos
+                 low-pass at the long limit of the synoptic band (10 days), and the
+                 synoptic part left. Each part is correlated with the same part of
+                 the wave, and the slow part also with the position of the axis,
+                 against the surrogates
+ 8  response     the median uplift in quintiles of the coastal trapped wave (signed
+                 so that its upwelling phase is positive) and of the position of
+                 the axis, a dose and response that does not rest on the straight
+                 line of a correlation. Each median is set against the range it
+                 takes when the uplift is replaced by phase randomised surrogates
+                 built campaign by campaign, which keep the persistence of the
+                 uplift and of the predictor, and the rank correlation is set
+                 against the level of the same surrogates. Days that share one
+                 value of a predictor fall in one class, so a predictor that moves
+                 by steps, as the axis found on the altimetry grid, gets fewer
+                 classes.
+
+Everything added to the earlier version (the intervals of the modes, the partition,
+the grid, the reconstruction and the coherence, the parts and the response) draws
+from a random stream of its own and only adds columns, so every number of the
+earlier tables is reproduced unchanged.
 
 Outputs in paper_v3
-    tables/fig05_modes.csv         modes by site and level
-    tables/fig05_partition.csv     split of the variance of the near-bottom temperature
-    tables/fig05_ctw_grid.csv      correlation over the phase speed and the decay time
-    tables/fig05_ctw.csv           chosen parameters and skill in campaigns left out
+    tables/fig05_modes.csv         modes by site and level, with intervals
+    tables/fig05_partition.csv     split of the variance of the near-bottom temperature, with intervals
+    tables/fig05_ctw_grid.csv      correlation over the phase speed and the decay time, with intervals
+    tables/fig05_ctw.csv           chosen parameters, skill in campaigns left out and the correlations
+                                   of the synoptic and of the slow part
     tables/fig05_attribution.csv   variance of eta explained, with intervals
-    tables/fig05_coherence.csv     coherence spectra
-    tables/fig05_daily.csv         daily eta, wave hindcast and position of the axis
+    tables/fig05_coherence.csv     coherence spectra, with the intervals of the partial coherences
+    tables/fig05_response.csv      median uplift in quintiles of the wave and of the axis, with the range
+                                   of the surrogates and the rank correlation
+    tables/fig05_daily.csv         daily eta with its slow and synoptic parts, wave hindcast with its
+                                   interval and position of the axis
     logs/fig05_compute.txt
 
 Created by Arian Dialectaquiz.
@@ -62,6 +90,7 @@ import warnings
 import numpy as np
 import pandas as pd
 import xarray as xr
+from scipy.stats import rankdata
 
 import config_v3 as V
 import inputs_v3 as I
@@ -69,6 +98,11 @@ import physics_v3 as P
 
 warnings.simplefilter('ignore', RuntimeWarning)
 LOG = []
+RESPONSE_BINS = 5          # classes of equal size of each predictor in the dose and response
+RESPONSE_MIN_DAYS = 15     # days a class needs to be kept
+SLOW_CUTOFF_DAYS = V.SYNOPTIC_DAYS[1]              # the slow part lies beyond the synoptic band
+SLOW_HALF_WINDOW = int(round(1.5 * SLOW_CUTOFF_DAYS))   # half window of its low-pass, days
+SLOW_MIN_WEIGHT = 0.8      # share of the filter weight that must fall on days with data
 
 
 def say(msg=''):
@@ -99,9 +133,11 @@ def anomalies(day, cols):
 
 
 # ------------------------------------------------------------- 1 modes
-def modes(site, day):
+def modes(site, day, rng):
     """Empirical orthogonal functions of the daily temperature over the levels that leave the
-    most complete days, the sparsest level being dropped while fewer than 60 days remain."""
+    most complete days, the sparsest level being dropped while fewer than 60 days remain. The
+    intervals come from blocks of days resampled inside the campaigns, every resampled mode
+    being given the sign of the mode of the record."""
     cols = [c for c in (f'T{z}' for z in V.LEVELS[site]) if c in day and day[c].notna().mean() > 0.2]
     an = anomalies(day, cols)
     while len(cols) > 3 and len(an[cols].dropna()) < 60:
@@ -115,30 +151,45 @@ def modes(site, day):
     order = np.argsort(val)[::-1]
     val, vec = val[order], vec[:, order]
     frac = val / val.sum()
+    load = vec[:, :2] * np.sqrt(val[:2])
+    load = load * np.where(load.sum(axis=0) < 0, -1.0, 1.0)
+    camp = an.loc[a.index, 'campaign'].values
+    b_load, b_frac = [], []
+    for _ in range(V.N_BOOT):
+        j = block_index(camp, camp.size, rng)
+        vb, eb = np.linalg.eigh(np.cov(a.values[j].T))
+        ob = np.argsort(vb)[::-1]
+        vb, eb = vb[ob], eb[:, ob]
+        lb = eb[:, :2] * np.sqrt(vb[:2])
+        b_load.append(lb * np.where((lb * load).sum(axis=0) < 0, -1.0, 1.0))
+        b_frac.append(vb[:2] / vb.sum())
+    l_lo, l_hi = np.percentile(b_load, [2.5, 97.5], axis=0)
+    f_lo, f_hi = np.percentile(b_frac, [2.5, 97.5], axis=0)
     rows = []
     for m in range(2):
-        v = vec[:, m] * np.sqrt(val[m])
-        if v.sum() < 0:
-            v = -v
-        for c, amp in zip(cols, v):
-            rows.append(dict(site=site, mode=m + 1, level=int(c[1:]), amplitude=float(amp),
-                             fraction=float(frac[m]), n_days=len(a)))
+        for i, c in enumerate(cols):
+            rows.append(dict(site=site, mode=m + 1, level=int(c[1:]), amplitude=float(load[i, m]),
+                             amp_lo=float(l_lo[i, m]), amp_hi=float(l_hi[i, m]),
+                             fraction=float(frac[m]), fraction_lo=float(f_lo[m]), fraction_hi=float(f_hi[m]),
+                             n_days=len(a)))
     one_sign = np.all(vec[:, 0] * np.sign(vec[:, 0].sum()) > 0)
     say(f'    modes of the temperature over {len(a)} days at {" ".join(c[1:] for c in cols)} m: the first carries '
-        f'{100 * frac[0]:.0f} % with {"one sign" if one_sign else "a change of sign"} over the column, the '
-        f'second {100 * frac[1]:.0f} %')
+        f'{100 * frac[0]:.0f} % ({100 * f_lo[0]:.0f} to {100 * f_hi[0]:.0f}) with '
+        f'{"one sign" if one_sign else "a change of sign"} over the column, the second {100 * frac[1]:.0f} %')
     return rows
 
 
 # --------------------------------------------------------- 2 partition
-def partition(site, day):
+def partition(site, day, rng):
     """The near-bottom temperature split into the part of the interior variability that reaches
     it and the variability of the layer itself, T'_194 = beta T'_155 + r, with r uncorrelated
     with the interior, so that beta^2 var(T_155) + var(r) = var(T_194) and beta is the share of
-    the interior heave that reaches the lowest meter."""
+    the interior uplift that reaches the lowest meter. The intervals come from blocks of days
+    resampled inside the campaigns."""
     if not {'T155', 'T194'}.issubset(day.columns):
         return None
-    a = anomalies(day, ['T155', 'T194'])[['T155', 'T194']].dropna()
+    an = anomalies(day, ['T155', 'T194'])
+    a = an[['T155', 'T194']].dropna()
     if len(a) < 60:
         say(f'    partition left out, {len(a)} days with both levels')
         return None
@@ -150,8 +201,18 @@ def partition(site, day):
                transmitted=float(beta ** 2 * np.var(a.T155) / vb), own=float(np.var(resid) / vb),
                interior=float(np.var(a.T155) / vb), layer=float(np.var(D) / vb),
                covariance=float(2 * np.cov(a.T155, D)[0, 1] / vb))
-    say(f'    near-bottom temperature over {len(a)} days: {100 * beta:.0f} % of the interior heave reaches the '
-        f'lowest meter, the heave it carries is {100 * row["transmitted"]:.0f} % of its variance and the '
+    camp = an.loc[a.index, 'campaign'].values
+    xi, xb = a.T155.values, a.T194.values
+    boot = []
+    for _ in range(V.N_BOOT):
+        j = block_index(camp, camp.size, rng)
+        bj = np.cov(xi[j], xb[j])[0, 1] / np.var(xi[j], ddof=1)
+        boot.append((bj, bj ** 2 * np.var(xi[j]) / np.var(xb[j])))
+    (row['beta_lo'], row['transmitted_lo']), (row['beta_hi'], row['transmitted_hi']) = \
+        (tuple(float(v) for v in q) for q in np.percentile(boot, [2.5, 97.5], axis=0))
+    say(f'    near-bottom temperature over {len(a)} days: {100 * beta:.0f} % of the interior uplift reaches the '
+        f'lowest meter, the uplift it carries is {100 * row["transmitted"]:.0f} % '
+        f'({100 * row["transmitted_lo"]:.0f} to {100 * row["transmitted_hi"]:.0f}) of its variance and the '
         f'variability of the layer itself {100 * row["own"]:.0f} %')
     return row
 
@@ -293,10 +354,110 @@ def surrogate_level(y, x, camp, rng):
     return float(np.percentile(rs, 95))
 
 
+def boot_correlation(y, x, sets):
+    """95 % interval of the correlation between y and x over resampled sets of days."""
+    rs = []
+    for j in sets:
+        m = np.isfinite(x[j]) & np.isfinite(y[j])
+        rs.append(np.corrcoef(x[j][m], y[j][m])[0, 1] if m.sum() > 30 else np.nan)
+    return np.nanpercentile(rs, [2.5, 97.5]) if np.isfinite(rs).any() else (np.nan, np.nan)
+
+
+def slow_part(y, camp):
+    """Lanczos low-pass of the daily uplift at SLOW_CUTOFF_DAYS (Duchon 1979), campaign by
+    campaign. The weights are renormalised over the days with data, and a day is left
+    undefined where those days hold less than SLOW_MIN_WEIGHT of the weight, which leaves
+    out the ends of the campaigns and the neighbourhood of long gaps."""
+    w = P.lanczos_weights(24.0 * SLOW_CUTOFF_DAYS, SLOW_HALF_WINDOW, dt_h=24.0)
+    out = np.full(y.size, np.nan)
+    for c in np.unique(camp):
+        k = np.flatnonzero(camp == c)
+        good = np.isfinite(y[k])
+        num = np.convolve(np.where(good, y[k], 0.0), w, mode='same')
+        den = np.convolve(good.astype(float), w, mode='same')
+        out[k] = np.where(den >= SLOW_MIN_WEIGHT, num / np.where(den == 0, np.nan, den), np.nan)
+    return out
+
+
+def rank_correlation(a, b):
+    return float(np.corrcoef(rankdata(a), rankdata(b))[0, 1])
+
+
+def correlation_and_level(y, x, camp, rng):
+    """Correlation between y and x and the 95 % level of the surrogates of y."""
+    ok = np.isfinite(y) & np.isfinite(x)
+    if ok.sum() <= 30 or np.std(x[ok]) == 0:
+        return np.nan, np.nan
+    return float(np.corrcoef(x[ok], y[ok])[0, 1]), surrogate_level(y, x, camp, rng)
+
+
+def response(site, name, y, x, camp, rng):
+    """Dose and response of the uplift y to the predictor x. The days are split into classes
+    of equal size of x, days that share one value falling in one class, and the median
+    uplift of each class is set against the range it takes when the uplift is replaced by
+    phase randomised surrogates built campaign by campaign (Ebisuzaki 1997). The surrogates
+    keep the spectrum of the uplift and leave the predictor as it is, so the range holds
+    the persistence of both. The rank correlation is set against the same surrogates."""
+    ok = np.isfinite(y) & np.isfinite(x)
+    if ok.sum() < 60 or np.std(x[ok]) == 0:
+        return []
+    idx = np.flatnonzero(ok)
+    xs = (x - np.mean(x[idx])) / np.std(x[idx])
+    edges = np.unique(np.quantile(xs[idx], np.linspace(0.0, 1.0, RESPONSE_BINS + 1)))
+    nb = edges.size - 1
+    if nb < 2:
+        return []
+    cls = np.clip(np.searchsorted(edges, xs, side='right') - 1, 0, nb - 1)
+
+    def medians(v, k):
+        return np.array([np.median(v[k == b]) if (k == b).sum() >= 3 else np.nan for b in range(nb)])
+
+    base, centre, raw = medians(y[idx], cls[idx]), medians(xs[idx], cls[idx]), medians(x[idx], cls[idx])
+    count = np.array([(cls[idx] == b).sum() for b in range(nb)])
+    rho = rank_correlation(xs[idx], y[idx])
+    null, rho_null = [], []
+    for _ in range(V.N_SURROGATE):
+        ys = np.full(y.size, np.nan)
+        for c in np.unique(camp[idx]):
+            k = idx[camp[idx] == c]
+            if k.size > 8:
+                ys[k] = P.surrogate(y[k], rng)
+        m = idx[np.isfinite(ys[idx])]
+        null.append(medians(ys[m], cls[m]))
+        rho_null.append(abs(rank_correlation(xs[m], ys[m])))
+    n_lo, n_hi = np.nanpercentile(null, [2.5, 97.5], axis=0)
+    rho_level = float(np.percentile(rho_null, 95))
+    keep = [b for b in range(nb) if count[b] >= RESPONSE_MIN_DAYS and np.isfinite(base[b])]
+    rows = [dict(site=site, predictor=name, x=float(centre[b]), x_raw=float(raw[b]), eta=float(base[b]),
+                 null_lo=float(n_lo[b]), null_hi=float(n_hi[b]), n_days=int(count[b]), rho=rho,
+                 rho_level=rho_level) for b in keep]
+    if rows:
+        outside = sum(1 for r_ in rows if not r_['null_lo'] <= r_['eta'] <= r_['null_hi'])
+        say(f'    response to the {name}: median uplift from {rows[0]["eta"]:+.0f} m in the lowest of {len(rows)} '
+            f'classes (surrogates {rows[0]["null_lo"]:+.0f} to {rows[0]["null_hi"]:+.0f}) to {rows[-1]["eta"]:+.0f} m '
+            f'in the highest ({rows[-1]["null_lo"]:+.0f} to {rows[-1]["null_hi"]:+.0f}), {outside} of {len(rows)} '
+            f'classes outside the range of the surrogates, rank correlation {rho:+.2f} against a level of '
+            f'{rho_level:.2f}')
+    return rows
+
+
+def coherence_interval(g2, n_seg, conditioned=0):
+    """95 % interval of a squared coherence from n_seg segments, reduced by one degree of freedom
+    for every conditioning input. The inverse hyperbolic tangent of the coherence is close to
+    normal, with a variance and a bias of 1 / (2 n - 2) (Bendat and Piersol 2010, Thomson and
+    Emery 2014). With independent segments the interval holds the true value 95 % of the times
+    for squared coherences above 0.1 and about 90 % of the times for no coherence at all."""
+    n = max(n_seg - conditioned, 2)
+    w = np.arctanh(np.sqrt(np.clip(np.asarray(g2, float), 0.0, 0.999999)))
+    bias, sd = 1.0 / (2 * n - 2), 1.0 / np.sqrt(2 * n - 2)
+    return np.tanh(np.maximum(w - bias - 1.96 * sd, 0.0)) ** 2, np.tanh(w - bias + 1.96 * sd) ** 2
+
+
 def main():
     V.make_dirs()
     rng = np.random.default_rng(505)
-    say('figure 5, what brings the central water to the 200 m isobath')
+    rng_i = np.random.default_rng(506)        # stream of the added intervals, the earlier numbers stay as they were
+    say('figure 5, what brings the SACW to the 200 m isobath')
     geo, _ = I.geometry(verbose=False)
     lp = I.lp_files(verbose=False)
     gebco, zname = I.open_gebco()
@@ -304,14 +465,14 @@ def main():
     path = forcing_path(gebco, zname)
     tau = path_stress(path)
     mod4 = pd.read_csv(V.DIR_TAB / 'fig04_model.csv') if (V.DIR_TAB / 'fig04_model.csv').exists() else pd.DataFrame()
-    modes_rows, parts, grid_rows, ctw_rows, attr, coh, daily_out = [], [], [], [], [], [], []
+    modes_rows, parts, grid_rows, ctw_rows, attr, coh, daily_out, resp = [], [], [], [], [], [], [], []
     for site in V.SITES_200:
         if site not in lp or site not in geo.index:
             continue
         say(f'\n  {site}')
         day = daily_records(site, lp)
-        modes_rows += modes(site, day)
-        p = partition(site, day)
+        modes_rows += modes(site, day, rng_i)
+        p = partition(site, day, rng_i)
         if p is not None:
             parts.append(p)
         if not {'T85', 'T155'}.issubset(day.columns):
@@ -339,10 +500,13 @@ def main():
             return out
 
         Ha = {k: anom(v) for k, v in H.items()}
+        fin = np.flatnonzero(np.isfinite(y))
+        sets = [fin[block_index(camp[fin], fin.size, rng_i)] for _ in range(V.N_BOOT)]
         for (c, tf), h in Ha.items():
             ok = np.isfinite(h) & np.isfinite(y)
             r = np.corrcoef(h[ok], y[ok])[0, 1] if ok.sum() > 30 else np.nan
-            grid_rows.append(dict(site=site, c=c, tf_days=tf, r=r))
+            r_lo, r_hi = boot_correlation(y, h, sets) if ok.sum() > 30 else (np.nan, np.nan)
+            grid_rows.append(dict(site=site, c=c, tf_days=tf, r=r, r_lo=r_lo, r_hi=r_hi))
         g = pd.DataFrame([x for x in grid_rows if x['site'] == site])
         best = g.loc[g.r.abs().idxmax()]
         # the choice of c and T_f and its skill in campaigns left out
@@ -370,6 +534,19 @@ def main():
         ctw_rows.append(dict(site=site, c=best.c, tf_days=best.tf_days, r=best.r, r_level=lvl,
                              r_cv=r_cv, skill_cv=skill_cv, c_min_cv=min(cs), c_max_cv=max(cs),
                              x_site_km=x_site))
+        # the slow and the synoptic part of the uplift against the wave
+        slow = slow_part(y, camp)
+        syn = y - slow
+        h_slow = slow_part(h_best, camp)
+        h_syn = h_best - h_slow                    # the wave split as the uplift, like against like
+        r_syn, lvl_syn = correlation_and_level(syn, h_syn, camp, rng_i)
+        r_slw, lvl_slw = correlation_and_level(slow, h_slow, camp, rng_i)
+        both_parts = np.isfinite(syn)
+        share = float(np.var(syn[both_parts]) / np.var(y[both_parts])) if both_parts.sum() > 30 else np.nan
+        ctw_rows[-1].update(r_syn=r_syn, r_syn_level=lvl_syn, r_slow=r_slw, r_slow_level=lvl_slw, syn_share=share)
+        say(f'    synoptic part (periods under {SLOW_CUTOFF_DAYS:g} days, {100 * share:.0f} % of the variance of the '
+            f'uplift): correlation {r_syn:+.2f} with the synoptic part of the wave, level {lvl_syn:.2f}. Slow part: '
+            f'correlation {r_slw:+.2f} with the slow part of the wave, level {lvl_slw:.2f}')
         say(f'    wave: correlation {best.r:+.2f} for c {best.c:.0f} m s-1 and T_f {best.tf_days:g} days, level '
             f'of the surrogates {lvl:.2f}, in campaigns left out correlation {r_cv:+.2f} and skill '
             f'{skill_cv:.2f}, c chosen between {min(cs):.0f} and {max(cs):.0f} m s-1')
@@ -380,6 +557,9 @@ def main():
         rE = np.corrcoef(E[okE], y[okE])[0, 1] if okE.sum() > 30 else np.nan
         lvlE = surrogate_level(y, E, camp, rng) if okE.sum() > 30 else np.nan
         say(f'    position of the axis: correlation {rE:+.2f} with the uplift, level of the surrogates {lvlE:.2f}')
+        r_sa, lvl_sa = correlation_and_level(slow, E, camp, rng_i)
+        ctw_rows[-1].update(r_slow_axis=r_sa, r_slow_axis_level=lvl_sa)
+        say(f'    slow part of the uplift: correlation {r_sa:+.2f} with the position of the axis, level {lvl_sa:.2f}')
 
         # ------------------------------------------------------------ attribution
         useE = okE.sum() > 30 and np.nanstd(E) > 0
@@ -402,6 +582,10 @@ def main():
                              n_days=int(full.sum())))
             say(f'    uplift explained by {name}: {100 * val:.0f} % ({100 * lo:.0f} to {100 * hi:.0f}) over '
                 f'{int(full.sum())} days')
+        # ------------------------------------------------------ dose and response
+        resp += response(site, 'wave', y, np.sign(best.r) * h_best, camp, rng_i)
+        if useE:
+            resp += response(site, 'axis', y, E, camp, rng_i)
         m4 = mod4[mod4.site == site] if len(mod4) else pd.DataFrame()
         for _, r4 in m4.iterrows():
             attr.append(dict(site=site, target='layer', predictor=f'layer model forced by the {r4.forcing} flow',
@@ -423,9 +607,13 @@ def main():
         flat = S is not None and (np.nanmin(np.abs(S[1:, 1, 1])) == 0 or np.nanmin(np.abs(S[1:, 0, 0])) == 0)
         if S is not None and nseg >= 3 and not flat:
             g1, g2, p1, p2, mult = P.coherences(S)
+            p1_lo, p1_hi = coherence_interval(p1, nseg, 1)
+            p2_lo, p2_hi = coherence_interval(p2, nseg, 1)
             for k in range(1, f.size):
                 coh.append(dict(site=site, freq_cpd=f[k], period_days=1.0 / f[k], wave=g1[k],
                                 axis=g2[k], wave_partial=p1[k], axis_partial=p2[k],
+                                wave_partial_lo=p1_lo[k], wave_partial_hi=p1_hi[k],
+                                axis_partial_lo=p2_lo[k], axis_partial_hi=p2_hi[k],
                                 multiple=mult[k], n_segments=nseg, level=P.coherence_level(nseg),
                                 level_partial=P.coherence_level(nseg, 1)))
             for band, (a, b) in (('synoptic', V.SYNOPTIC_DAYS), ('mesoscale', V.MESOSCALE_DAYS)):
@@ -443,12 +631,31 @@ def main():
         bw = np.linalg.lstsq(Aw, y[full], rcond=None)[0]
         pred_w = np.full(y.size, np.nan)
         pred_b = np.full(y.size, np.nan)
+        pred_lo = np.full(y.size, np.nan)
+        pred_hi = np.full(y.size, np.nan)
         pred_w[full] = Aw @ bw
         pred_b[full] = A @ b
+        # interval of the reconstruction from the wave, the fit repeated over resampled blocks
+        y_full, camp_full, fits = y[full], camp[full], []
+        for _ in range(V.N_BOOT):
+            j = block_index(camp_full, y_full.size, rng_i)
+            fits.append(Aw @ np.linalg.lstsq(Aw[j], y_full[j], rcond=None)[0])
+        pred_lo[full], pred_hi[full] = np.percentile(fits, [2.5, 97.5], axis=0)
+        # the synoptic part of the reconstruction, each resampled fit filtered as the uplift
+        def synoptic(v):
+            z = np.full(y.size, np.nan)
+            z[full] = v
+            return z - slow_part(z, camp)
+
+        pred_syn = synoptic(Aw @ bw)
+        syn_lo, syn_hi = np.nanpercentile([synoptic(v) for v in fits], [2.5, 97.5], axis=0)
         daily_out.append(pd.DataFrame(dict(site=site, day=frame.index, campaign=camp, eta=y, wave=h_best,
-                                           axis=E, eta_wave=pred_w, eta_both=pred_b)))
+                                           axis=E, eta_wave=pred_w, eta_wave_lo=pred_lo, eta_wave_hi=pred_hi,
+                                           eta_both=pred_b, eta_slow=slow, eta_syn=syn, eta_wave_syn=pred_syn,
+                                           eta_wave_syn_lo=syn_lo, eta_wave_syn_hi=syn_hi)))
     for name, rows in (('fig05_modes', modes_rows), ('fig05_partition', parts), ('fig05_ctw_grid', grid_rows),
-                       ('fig05_ctw', ctw_rows), ('fig05_attribution', attr), ('fig05_coherence', coh)):
+                       ('fig05_ctw', ctw_rows), ('fig05_attribution', attr), ('fig05_coherence', coh),
+                       ('fig05_response', resp)):
         pd.DataFrame(rows).to_csv(V.DIR_TAB / f'{name}.csv', index=False)
     if daily_out:
         pd.concat(daily_out, ignore_index=True).to_csv(V.DIR_TAB / 'fig05_daily.csv', index=False)
